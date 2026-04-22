@@ -1,0 +1,76 @@
+name: CrowdStrike Image Assessment
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: myapp
+  IMAGE_TAG: ${{ github.sha }}
+  FALCON_REGION: us-2
+  DOCKERFILE_PATH: .
+
+jobs:
+  build-and-assess:
+    name: Build & Scan Image
+    runs-on: ubuntu-latest
+
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} ${{ env.DOCKERFILE_PATH }}
+
+      - name: CrowdStrike Image Scan
+        id: fcs
+        uses: crowdstrike/fcs-action@v3.0.0
+        with:
+          falcon_client_id: ${{ vars.FALCON_CLIENT_ID }}
+          falcon_region: ${{ env.FALCON_REGION }}
+          scan_type: image
+          image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          minimum_severity: high
+          upload_results: true
+          report_formats: sarif
+          output_path: ./scan-results.sarif
+        env:
+          FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+          FCS_VERBOSE: 'true'
+
+      - name: Check whether SARIF has findings
+        id: sarif_check
+        shell: bash
+        run: |
+          if [ ! -f ./scan-results.sarif ]; then
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RESULTS_COUNT=$(jq '[.runs[]?.results[]?] | length' ./scan-results.sarif)
+          echo "results_count=$RESULTS_COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$RESULTS_COUNT" -gt 0 ]; then
+            echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload SARIF to GitHub Security
+        if: steps.sarif_check.outputs.has_findings == 'true'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ./scan-results.sarif
+
+      - name: Fail on High or Critical vulnerabilities
+        if: steps.fcs.outputs.exit-code != 0
+        run: |
+          echo "Image scan found HIGH or CRITICAL severity vulnerabilities. Blocking push."
+          exit 1
